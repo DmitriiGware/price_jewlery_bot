@@ -1,0 +1,7 @@
+pyglet
+aiogram==3.21.0
+python-dotenv
+trimesh
+numpy
+scipy
+networkx
