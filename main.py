@@ -4,10 +4,10 @@ import os
 import aiohttp
 import trimesh
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import BotCommand, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 
@@ -31,6 +31,33 @@ dp = Dispatcher()
 PRICE_PER_CM3 = 850
 USER_REGISTRATIONS = {}
 USER_LAST_CALCULATIONS = {}
+USER_CARTS = {}
+HELP_BUTTON_TEXT = "/help"
+CART_COMMAND = "cart"
+CART_BUTTON_TEXT = "🛒 Корзина"
+CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
+REMOVE_CART_ITEM_TEXT = "🗑 Удалить объект"
+HELP_TEXT = """📘 Краткая инструкция
+
+/start — начать регистрацию заново.
+/help — показать эту справку.
+/cart — открыть корзину. Также можно нажать кнопку «🛒 Корзина».
+
+Как пользоваться ботом:
+1. Нажмите /start и выберите тип клиента.
+2. Для частного лица отправьте контакт или введите данные вручную.
+3. Для юрлица введите ИНН, подтвердите компанию и введите банковские реквизиты.
+4. После регистрации загрузите STL-файл модели.
+5. Бот посчитает объем, примерную стоимость и попросит выбрать материал.
+6. После подтверждения материала модель попадет в корзину.
+
+Расчет:
+• базовая цена — 850 руб./см3;
+• если объем больше 5 см3 — 650 руб./см3;
+• минимальная стоимость — 400 руб.
+
+В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
+Поддерживаемый файл: .stl"""
 
 
 class Registration(StatesGroup):
@@ -49,6 +76,14 @@ class MaterialSelection(StatesGroup):
     waiting_category = State()
     waiting_subcategory = State()
     confirming_material = State()
+
+
+class CartManagement(StatesGroup):
+    waiting_remove_index = State()
+    waiting_material_item_index = State()
+    waiting_material_category = State()
+    waiting_material_subcategory = State()
+    confirming_material_change = State()
 
 
 MATERIAL_OPTIONS = {
@@ -70,12 +105,20 @@ MATERIAL_OPTIONS = {
 }
 
 
+def service_keyboard_row() -> list[KeyboardButton]:
+    return [
+        KeyboardButton(text=HELP_BUTTON_TEXT),
+        KeyboardButton(text=CART_BUTTON_TEXT),
+    ]
+
+
 customer_type_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(text="👤 Частное лицо"),
             KeyboardButton(text="🏢 Юридическое лицо"),
-        ]
+        ],
+        service_keyboard_row(),
     ],
     resize_keyboard=True,
 )
@@ -88,6 +131,7 @@ contact_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="✍️ Ввести вручную"),
         ],
+        service_keyboard_row(),
     ],
     resize_keyboard=True,
 )
@@ -97,7 +141,8 @@ confirm_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="✅ Верно"),
             KeyboardButton(text="❌ Другая"),
-        ]
+        ],
+        service_keyboard_row(),
     ],
     resize_keyboard=True,
 )
@@ -106,7 +151,7 @@ material_category_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=category)]
         for category in MATERIAL_OPTIONS
-    ],
+    ] + [service_keyboard_row()],
     resize_keyboard=True,
 )
 
@@ -116,7 +161,7 @@ def build_material_subcategory_keyboard(category: str) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=subcategory)]
             for subcategory in MATERIAL_OPTIONS[category]
-        ],
+        ] + [service_keyboard_row()],
         resize_keyboard=True,
     )
 
@@ -126,7 +171,8 @@ material_confirm_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="✅ Верно"),
             KeyboardButton(text="🔄 Изменить"),
-        ]
+        ],
+        service_keyboard_row(),
     ],
     resize_keyboard=True,
 )
@@ -136,7 +182,24 @@ bank_details_confirm_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="✅ Верно"),
             KeyboardButton(text="✏️ Исправить"),
-        ]
+        ],
+        service_keyboard_row(),
+    ],
+    resize_keyboard=True,
+)
+
+help_keyboard = ReplyKeyboardMarkup(
+    keyboard=[service_keyboard_row()],
+    resize_keyboard=True,
+)
+
+cart_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text=CHANGE_CART_MATERIAL_TEXT),
+            KeyboardButton(text=REMOVE_CART_ITEM_TEXT),
+        ],
+        service_keyboard_row(),
     ],
     resize_keyboard=True,
 )
@@ -233,6 +296,74 @@ def limit_text(text: str, limit: int = 3000) -> str:
     return f"{text[:limit].rstrip()}\n\n..."
 
 
+def get_user_cart(user_id: int) -> list[dict]:
+    return USER_CARTS.setdefault(user_id, [])
+
+
+def format_money(value: float) -> str:
+    return f"{value:.0f} руб."
+
+
+def format_material(category: str | None, subcategory: str | None) -> str:
+    if category and subcategory:
+        return f"{category}, {subcategory}"
+    return "не выбран"
+
+
+def format_cart(user_id: int) -> str:
+    cart = get_user_cart(user_id)
+    if not cart:
+        return (
+            "🛒 Корзина пустая.\n\n"
+            "Загрузите .stl файл после регистрации, выберите материал — и модель появится здесь."
+        )
+
+    lines = ["🛒 Корзина", ""]
+    total = 0.0
+    for index, item in enumerate(cart, start=1):
+        total += item["price"]
+        lines.extend(
+            [
+                f"{index}. {item['file_name']}",
+                f"   Объем: {item['volume_cm3']:.3f} см3",
+                f"   Материал: {format_material(item.get('material_category'), item.get('material_subcategory'))}",
+                f"   Цена: {format_money(item['price'])}",
+                "",
+            ]
+        )
+
+    lines.append(f"Итого до доставки: {format_money(total)}")
+    return "\n".join(lines)
+
+
+def parse_cart_index(text: str | None, cart: list[dict]) -> int | None:
+    try:
+        index = int(normalize_text(text))
+    except ValueError:
+        return None
+
+    if 1 <= index <= len(cart):
+        return index - 1
+    return None
+
+
+def is_cart_request(text: str | None) -> bool:
+    return normalize_text(text).lower() in {
+        "корзина",
+        "/корзина",
+        "/korzina",
+        CART_BUTTON_TEXT.lower(),
+    }
+
+
+async def send_cart(message: Message):
+    cart = get_user_cart(message.from_user.id)
+    await message.answer(
+        format_cart(message.from_user.id),
+        reply_markup=cart_keyboard if cart else help_keyboard,
+    )
+
+
 async def ask_to_confirm_bank_details(message: Message, state: FSMContext, bank_details: str):
     await state.update_data(bank_details=bank_details)
     await message.answer(
@@ -248,9 +379,24 @@ async def complete_registration(message: Message, state: FSMContext, registratio
 
     await message.answer(
         "✅ Регистрация завершена.\n📎 Загрузите ваш .stl файл для расчета.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.clear()
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(HELP_TEXT, reply_markup=help_keyboard)
+
+
+@dp.message(Command(CART_COMMAND))
+async def cart_command(message: Message):
+    await send_cart(message)
+
+
+@dp.message(lambda message: is_cart_request(message.text))
+async def cart_button(message: Message):
+    await send_cart(message)
 
 
 @dp.message(CommandStart())
@@ -261,6 +407,156 @@ async def start(message: Message, state: FSMContext):
         reply_markup=customer_type_keyboard,
     )
     await state.set_state(Registration.choosing_customer_type)
+
+
+@dp.message(F.text == CHANGE_CART_MATERIAL_TEXT)
+async def start_cart_material_change(message: Message, state: FSMContext):
+    cart = get_user_cart(message.from_user.id)
+    if not cart:
+        await send_cart(message)
+        return
+
+    await message.answer(
+        f"{format_cart(message.from_user.id)}\n\nВведите номер модели, у которой нужно изменить материал:",
+        reply_markup=help_keyboard,
+    )
+    await state.set_state(CartManagement.waiting_material_item_index)
+
+
+@dp.message(F.text == REMOVE_CART_ITEM_TEXT)
+async def start_cart_item_remove(message: Message, state: FSMContext):
+    cart = get_user_cart(message.from_user.id)
+    if not cart:
+        await send_cart(message)
+        return
+
+    await message.answer(
+        f"{format_cart(message.from_user.id)}\n\nВведите номер модели, которую нужно удалить:",
+        reply_markup=help_keyboard,
+    )
+    await state.set_state(CartManagement.waiting_remove_index)
+
+
+@dp.message(CartManagement.waiting_remove_index)
+async def remove_cart_item(message: Message, state: FSMContext):
+    cart = get_user_cart(message.from_user.id)
+    cart_index = parse_cart_index(message.text, cart)
+    if cart_index is None:
+        await message.answer("Введите номер модели из корзины:", reply_markup=help_keyboard)
+        return
+
+    removed_item = cart.pop(cart_index)
+    await message.answer(
+        f"🗑 Удалено: {removed_item['file_name']}\n\n{format_cart(message.from_user.id)}",
+        reply_markup=cart_keyboard if cart else help_keyboard,
+    )
+    await state.clear()
+
+
+@dp.message(CartManagement.waiting_material_item_index)
+async def choose_cart_item_for_material_change(message: Message, state: FSMContext):
+    cart = get_user_cart(message.from_user.id)
+    cart_index = parse_cart_index(message.text, cart)
+    if cart_index is None:
+        await message.answer("Введите номер модели из корзины:", reply_markup=help_keyboard)
+        return
+
+    await state.update_data(cart_item_index=cart_index)
+    await message.answer(
+        "💍 Выберите новый материал финального отлива:",
+        reply_markup=material_category_keyboard,
+    )
+    await state.set_state(CartManagement.waiting_material_category)
+
+
+@dp.message(CartManagement.waiting_material_category, F.text.in_(MATERIAL_OPTIONS.keys()))
+async def choose_cart_material_category(message: Message, state: FSMContext):
+    category = message.text
+    await state.update_data(material_category=category)
+    await message.answer(
+        "🔬 Выберите пробу:",
+        reply_markup=build_material_subcategory_keyboard(category),
+    )
+    await state.set_state(CartManagement.waiting_material_subcategory)
+
+
+@dp.message(CartManagement.waiting_material_category)
+async def choose_cart_material_category_again(message: Message):
+    await message.answer(
+        "💍 Пожалуйста, выберите материал из списка:",
+        reply_markup=material_category_keyboard,
+    )
+
+
+@dp.message(CartManagement.waiting_material_subcategory)
+async def choose_cart_material_subcategory(message: Message, state: FSMContext):
+    data = await state.get_data()
+    category = data.get("material_category")
+    subcategory = normalize_text(message.text)
+
+    if not category:
+        await message.answer(
+            "💍 Пожалуйста, выберите материал:",
+            reply_markup=material_category_keyboard,
+        )
+        await state.set_state(CartManagement.waiting_material_category)
+        return
+
+    if subcategory not in MATERIAL_OPTIONS.get(category, []):
+        await message.answer(
+            "🔬 Пожалуйста, выберите пробу из списка:",
+            reply_markup=build_material_subcategory_keyboard(category),
+        )
+        return
+
+    await state.update_data(material_subcategory=subcategory)
+    await message.answer(
+        f"💍 Новый материал:\n{category}\n{subcategory}\n\nПодтвердите изменение?",
+        reply_markup=material_confirm_keyboard,
+    )
+    await state.set_state(CartManagement.confirming_material_change)
+
+
+@dp.message(CartManagement.confirming_material_change, F.text == "✅ Верно")
+async def confirm_cart_material_change(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cart = get_user_cart(message.from_user.id)
+    cart_index = data.get("cart_item_index")
+
+    if cart_index is None or cart_index >= len(cart):
+        await message.answer(
+            "Позиция в корзине не найдена. Откройте корзину и попробуйте еще раз.",
+            reply_markup=help_keyboard,
+        )
+        await state.clear()
+        return
+
+    cart[cart_index]["material_category"] = data.get("material_category")
+    cart[cart_index]["material_subcategory"] = data.get("material_subcategory")
+
+    await message.answer(
+        f"✅ Материал обновлен.\n\n{format_cart(message.from_user.id)}",
+        reply_markup=cart_keyboard,
+    )
+    await state.clear()
+
+
+@dp.message(CartManagement.confirming_material_change, F.text == "🔄 Изменить")
+async def retry_cart_material_change(message: Message, state: FSMContext):
+    await state.update_data(material_category=None, material_subcategory=None)
+    await message.answer(
+        "💍 Выберите новый материал финального отлива:",
+        reply_markup=material_category_keyboard,
+    )
+    await state.set_state(CartManagement.waiting_material_category)
+
+
+@dp.message(CartManagement.confirming_material_change)
+async def confirm_cart_material_change_again(message: Message):
+    await message.answer(
+        "👇 Нажмите «✅ Верно» или «🔄 Изменить».",
+        reply_markup=material_confirm_keyboard,
+    )
 
 
 @dp.message(Registration.choosing_customer_type, F.text == "👤 Частное лицо")
@@ -284,7 +580,7 @@ async def choose_company(message: Message, state: FSMContext):
     )
     await message.answer(
         "🧾 Введите ИНН ИП или компании:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_company_inn)
 
@@ -308,7 +604,7 @@ async def get_private_contact(message: Message, state: FSMContext):
 
     await message.answer(
         "📧 Введите email:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_private_email)
 
@@ -317,7 +613,7 @@ async def get_private_contact(message: Message, state: FSMContext):
 async def enter_private_data_manually(message: Message, state: FSMContext):
     await message.answer(
         "👤 Введите имя:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_private_name)
 
@@ -399,7 +695,7 @@ async def get_company_inn(message: Message, state: FSMContext):
 async def confirm_company(message: Message, state: FSMContext):
     await message.answer(
         "🏦 Введите банковские реквизиты текстом:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_company_bank_details)
 
@@ -409,7 +705,7 @@ async def retry_company_inn(message: Message, state: FSMContext):
     await state.update_data(inn=None, company=None)
     await message.answer(
         "🧾 Введите ИНН еще раз:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_company_inn)
 
@@ -444,7 +740,7 @@ async def confirm_company_bank_details(message: Message, state: FSMContext):
 async def edit_company_bank_details(message: Message, state: FSMContext):
     await message.answer(
         "✏️ Введите банковские реквизиты текстом:",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=help_keyboard,
     )
     await state.set_state(Registration.waiting_company_bank_details)
 
@@ -573,13 +869,19 @@ async def confirm_material(message: Message, state: FSMContext):
     subcategory = data.get("material_subcategory")
 
     last_calculation = USER_LAST_CALCULATIONS.get(message.from_user.id, {})
+    if not last_calculation:
+        await message.answer("Сначала загрузите .stl файл для расчета.", reply_markup=help_keyboard)
+        await state.clear()
+        return
+
     last_calculation["material_category"] = category
     last_calculation["material_subcategory"] = subcategory
     USER_LAST_CALCULATIONS[message.from_user.id] = last_calculation
+    get_user_cart(message.from_user.id).append(last_calculation.copy())
 
     await message.answer(
-        f"✅ Материал выбран:\n{category}\n{subcategory}",
-        reply_markup=ReplyKeyboardRemove(),
+        f"✅ Модель добавлена в корзину.\n\n{format_cart(message.from_user.id)}",
+        reply_markup=cart_keyboard,
     )
     await state.clear()
 
@@ -603,6 +905,13 @@ async def confirm_material_again(message: Message):
 
 
 async def main():
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Начать регистрацию"),
+            BotCommand(command="help", description="Краткая инструкция"),
+            BotCommand(command=CART_COMMAND, description="Открыть корзину"),
+        ]
+    )
     await dp.start_polling(bot)
 
 
