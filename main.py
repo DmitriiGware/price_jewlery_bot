@@ -32,9 +32,11 @@ PRICE_PER_CM3 = 850
 USER_REGISTRATIONS = {}
 USER_LAST_CALCULATIONS = {}
 USER_CARTS = {}
+USER_PENDING_FILES = {}
 HELP_BUTTON_TEXT = "/help"
 CART_COMMAND = "cart"
 CART_BUTTON_TEXT = "🛒 Корзина"
+CALCULATE_BUTTON_TEXT = "🧮 Сделать расчет"
 CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
 REMOVE_CART_ITEM_TEXT = "🗑 Удалить объект"
 HELP_TEXT = """📘 Краткая инструкция
@@ -47,9 +49,10 @@ HELP_TEXT = """📘 Краткая инструкция
 1. Нажмите /start и выберите тип клиента.
 2. Для частного лица отправьте контакт или введите данные вручную.
 3. Для юрлица введите ИНН, подтвердите компанию и введите банковские реквизиты.
-4. После регистрации загрузите STL-файл модели.
-5. Бот посчитает объем, примерную стоимость и попросит выбрать материал.
-6. После подтверждения материала модель попадет в корзину.
+4. После регистрации загружайте STL-файлы по одному.
+5. После каждого файла выберите материал финального отлива.
+6. Когда все файлы загружены и материалы выбраны, нажмите «🧮 Сделать расчет».
+7. Бот посчитает каждую модель и добавит рассчитанную пачку в корзину.
 
 Расчет:
 • базовая цена — 850 руб./см3;
@@ -93,10 +96,10 @@ MATERIAL_OPTIONS = {
     ],
     "🥇 Золото": [
         "585 проба белая",
-        "750 проба белая",
         "585 проба желтая",
-        "750 проба желтая",
         "585 проба красная",
+        "750 проба белая",
+        "750 проба желтая",
         "750 проба красная",
     ],
     "⚪ Платина": [
@@ -204,6 +207,14 @@ cart_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+upload_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=CALCULATE_BUTTON_TEXT)],
+        service_keyboard_row(),
+    ],
+    resize_keyboard=True,
+)
+
 
 def normalize_text(text: str | None) -> str:
     return (text or "").strip()
@@ -300,8 +311,28 @@ def get_user_cart(user_id: int) -> list[dict]:
     return USER_CARTS.setdefault(user_id, [])
 
 
+def get_user_pending_files(user_id: int) -> list[dict]:
+    return USER_PENDING_FILES.setdefault(user_id, [])
+
+
 def format_money(value: float) -> str:
     return f"{value:.0f} руб."
+
+
+def calculate_model_price(volume_cm3: float) -> tuple[float, int]:
+    price_per_cm3 = PRICE_PER_CM3
+    if volume_cm3 > 5:
+        price_per_cm3 = 650
+
+    price = volume_cm3 * price_per_cm3
+    if price < 400:
+        price = 400
+
+    return price, price_per_cm3
+
+
+def safe_file_name(file_name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in file_name)
 
 
 def format_material(category: str | None, subcategory: str | None) -> str:
@@ -336,6 +367,40 @@ def format_cart(user_id: int) -> str:
     return "\n".join(lines)
 
 
+def format_calculation_summary(items: list[dict], errors: list[str] | None = None) -> str:
+    lines = ["🧮 Расчет готов", ""]
+    total = 0.0
+    for index, item in enumerate(items, start=1):
+        total += item["price"]
+        lines.extend(
+            [
+                f"{index}. {item['file_name']}",
+                f"   Объем: {item['volume_mm3']:.2f} мм3",
+                f"   Объем: {item['volume_cm3']:.3f} см3",
+                f"   Материал: {format_material(item.get('material_category'), item.get('material_subcategory'))}",
+                f"   Цена: {format_money(item['price'])}",
+                "",
+            ]
+        )
+
+    lines.append(f"Итого до доставки: {format_money(total)}")
+
+    if errors:
+        lines.extend(["", "Не удалось обработать:"])
+        lines.extend(f"• {error}" for error in errors)
+
+    return "\n".join(lines)
+
+
+def format_pending_file_material_prompt(pending_files: list[dict], item_index: int) -> str:
+    item = pending_files[item_index]
+    return (
+        f"💍 Материал для файла {item_index + 1}/{len(pending_files)}\n"
+        f"{item['file_name']}\n\n"
+        "Выберите материал финального отлива:"
+    )
+
+
 def parse_cart_index(text: str | None, cart: list[dict]) -> int | None:
     try:
         index = int(normalize_text(text))
@@ -364,6 +429,111 @@ async def send_cart(message: Message):
     )
 
 
+async def ask_material_for_pending_file(message: Message, state: FSMContext, item_index: int):
+    pending_files = get_user_pending_files(message.from_user.id)
+    if not pending_files or item_index >= len(pending_files):
+        await message.answer(
+            "Сначала загрузите .stl файл.",
+            reply_markup=upload_keyboard,
+        )
+        await state.clear()
+        return
+
+    await state.update_data(
+        pending_file_index=item_index,
+        material_category=None,
+        material_subcategory=None,
+    )
+    await message.answer(
+        format_pending_file_material_prompt(pending_files, item_index),
+        reply_markup=material_category_keyboard,
+    )
+    await state.set_state(MaterialSelection.waiting_category)
+
+
+async def calculate_pending_files(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in USER_REGISTRATIONS:
+        await message.answer("📝 Сначала пройдите регистрацию через /start.", reply_markup=help_keyboard)
+        return
+
+    pending_files = get_user_pending_files(user_id)
+    if not pending_files:
+        await message.answer(
+            "📎 Сначала загрузите один или несколько .stl файлов.",
+            reply_markup=upload_keyboard,
+        )
+        return
+
+    files_without_material = [
+        pending_file["file_name"]
+        for pending_file in pending_files
+        if not pending_file.get("material_category") or not pending_file.get("material_subcategory")
+    ]
+    if files_without_material:
+        await message.answer(
+            "💍 Сначала выберите материал для каждого файла.\n\n"
+            "Без материала:\n"
+            + "\n".join(f"• {file_name}" for file_name in files_without_material),
+            reply_markup=upload_keyboard,
+        )
+        return
+
+    await state.clear()
+    await message.answer(f"🧮 Начинаю расчет: {len(pending_files)} файл(ов).")
+
+    os.makedirs("models", exist_ok=True)
+    calculated_items = []
+    errors = []
+
+    for index, pending_file in enumerate(pending_files, start=1):
+        file_name = pending_file["file_name"]
+        file_path = os.path.join("models", f"{user_id}_{index}_{safe_file_name(file_name)}")
+        await message.answer(f"Считаю {index}/{len(pending_files)}: {file_name}")
+
+        try:
+            await bot.download(pending_file["file_id"], destination=file_path)
+            mesh = trimesh.load(file_path)
+
+            volume_mm3 = mesh.volume
+            volume_cm3 = volume_mm3 / 1000
+            price, price_per_cm3 = calculate_model_price(volume_cm3)
+
+            calculated_items.append(
+                {
+                    "file_name": file_name,
+                    "volume_mm3": volume_mm3,
+                    "volume_cm3": volume_cm3,
+                    "price": price,
+                    "price_per_cm3": price_per_cm3,
+                    "material_category": pending_file.get("material_category"),
+                    "material_subcategory": pending_file.get("material_subcategory"),
+                }
+            )
+        except Exception as error:
+            errors.append(f"{file_name}: {error}")
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    USER_PENDING_FILES[user_id] = []
+
+    if not calculated_items:
+        await message.answer(
+            f"⚠️ Не удалось рассчитать файлы.\n\n" + "\n".join(errors),
+            reply_markup=upload_keyboard,
+        )
+        return
+
+    USER_LAST_CALCULATIONS[user_id] = calculated_items
+    get_user_cart(user_id).extend(item.copy() for item in calculated_items)
+    await message.answer(format_calculation_summary(calculated_items, errors))
+    await message.answer(
+        f"✅ Рассчитанные модели добавлены в корзину.\n\n{format_cart(user_id)}",
+        reply_markup=cart_keyboard,
+    )
+
+
 async def ask_to_confirm_bank_details(message: Message, state: FSMContext, bank_details: str):
     await state.update_data(bank_details=bank_details)
     await message.answer(
@@ -378,8 +548,8 @@ async def complete_registration(message: Message, state: FSMContext, registratio
     print(registration_data)
 
     await message.answer(
-        "✅ Регистрация завершена.\n📎 Загрузите ваш .stl файл для расчета.",
-        reply_markup=help_keyboard,
+        "✅ Регистрация завершена.\n📎 Загрузите один или несколько .stl файлов, затем нажмите «🧮 Сделать расчет».",
+        reply_markup=upload_keyboard,
     )
     await state.clear()
 
@@ -401,12 +571,18 @@ async def cart_button(message: Message):
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
+    USER_PENDING_FILES.pop(message.from_user.id, None)
     await state.clear()
     await message.answer(
         "👋 Выберите тип клиента:",
         reply_markup=customer_type_keyboard,
     )
     await state.set_state(Registration.choosing_customer_type)
+
+
+@dp.message(F.text == CALCULATE_BUTTON_TEXT)
+async def calculate_button(message: Message, state: FSMContext):
+    await calculate_pending_files(message, state)
 
 
 @dp.message(F.text == CHANGE_CART_MATERIAL_TEXT)
@@ -755,63 +931,28 @@ async def confirm_company_bank_details_again(message: Message):
 
 @dp.message(F.document)
 async def process_stl(message: Message, state: FSMContext):
-    await state.clear()
-
     if message.from_user.id not in USER_REGISTRATIONS:
-        await message.answer("📝 Сначала пройдите регистрацию через /start.")
+        await message.answer("📝 Сначала пройдите регистрацию через /start.", reply_markup=help_keyboard)
         return
 
     document = message.document
 
     if not document.file_name.lower().endswith(".stl"):
-        await message.answer("📎 Пожалуйста, отправьте .stl файл.")
+        await message.answer("📎 Пожалуйста, отправьте .stl файл.", reply_markup=upload_keyboard)
         return
 
-    os.makedirs("models", exist_ok=True)
-    file_path = os.path.join("models", document.file_name)
-
-    await bot.download(document, destination=file_path)
-
-    try:
-        mesh = trimesh.load(file_path)
-
-        volume_mm3 = mesh.volume
-        volume_cm3 = volume_mm3 / 1000
-
-        price_per_cm3 = PRICE_PER_CM3
-        if volume_cm3 > 5:
-            price_per_cm3 = 650
-
-        price = volume_cm3 * price_per_cm3
-        if price < 400:
-            price = 400
-
-        text = (
-            f"📐 Объем: {volume_mm3:.2f} мм3\n"
-            f"📦 Объем: {volume_cm3:.3f} см3\n"
-            f"💰 Стоимость: {price:.0f} руб."
-        )
-
-        await message.answer(text)
-        USER_LAST_CALCULATIONS[message.from_user.id] = {
+    await state.clear()
+    pending_files = get_user_pending_files(message.from_user.id)
+    pending_files.append(
+        {
+            "file_id": document.file_id,
             "file_name": document.file_name,
-            "volume_mm3": volume_mm3,
-            "volume_cm3": volume_cm3,
-            "price": price,
-            "price_per_cm3": price_per_cm3,
+            "material_category": None,
+            "material_subcategory": None,
         }
-        await message.answer(
-            "💍 Выберите категорию материала:",
-            reply_markup=material_category_keyboard,
-        )
-        await state.set_state(MaterialSelection.waiting_category)
-
-    except Exception as error:
-        await message.answer(f"⚠️ Ошибка обработки:\n{error}")
-
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    )
+    await message.answer(f"📎 Файл добавлен: {document.file_name}")
+    await ask_material_for_pending_file(message, state, len(pending_files) - 1)
 
 
 @dp.message(MaterialSelection.waiting_category, F.text.in_(MATERIAL_OPTIONS.keys()))
@@ -867,21 +1008,23 @@ async def confirm_material(message: Message, state: FSMContext):
     data = await state.get_data()
     category = data.get("material_category")
     subcategory = data.get("material_subcategory")
+    pending_file_index = data.get("pending_file_index")
 
-    last_calculation = USER_LAST_CALCULATIONS.get(message.from_user.id, {})
-    if not last_calculation:
-        await message.answer("Сначала загрузите .stl файл для расчета.", reply_markup=help_keyboard)
+    pending_files = get_user_pending_files(message.from_user.id)
+    if pending_file_index is None or pending_file_index >= len(pending_files):
+        await message.answer("Сначала загрузите .stl файл.", reply_markup=upload_keyboard)
         await state.clear()
         return
 
-    last_calculation["material_category"] = category
-    last_calculation["material_subcategory"] = subcategory
-    USER_LAST_CALCULATIONS[message.from_user.id] = last_calculation
-    get_user_cart(message.from_user.id).append(last_calculation.copy())
+    pending_files[pending_file_index]["material_category"] = category
+    pending_files[pending_file_index]["material_subcategory"] = subcategory
 
     await message.answer(
-        f"✅ Модель добавлена в корзину.\n\n{format_cart(message.from_user.id)}",
-        reply_markup=cart_keyboard,
+        "✅ Материал сохранен для файла:\n"
+        f"{pending_files[pending_file_index]['file_name']}\n"
+        f"{format_material(category, subcategory)}\n\n"
+        "Загрузите следующий .stl файл или нажмите «🧮 Сделать расчет».",
+        reply_markup=upload_keyboard,
     )
     await state.clear()
 
