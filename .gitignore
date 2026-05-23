@@ -1,4 +1,6 @@
 .env
+bot_state.json
+bot_state.json.tmp
 .venv/
 __pycache__/
 models/

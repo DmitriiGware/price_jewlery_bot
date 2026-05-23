@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import aiohttp
@@ -21,6 +22,7 @@ def clean_secret(value: str | None) -> str:
 TOKEN = clean_secret(os.getenv("BOT_TOKEN"))
 DADATA_TOKEN = clean_secret(os.getenv("DADATA_TOKEN"))
 DADATA_FIND_PARTY_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
+STATE_FILE = "bot_state.json"
 
 if not TOKEN:
     raise RuntimeError("Заполните BOT_TOKEN в файле .env")
@@ -313,6 +315,40 @@ def limit_text(text: str, limit: int = 3000) -> str:
     return f"{text[:limit].rstrip()}\n\n..."
 
 
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Не удалось загрузить {STATE_FILE}: {error}")
+        return
+
+    USER_REGISTRATIONS.update(
+        {int(user_id): registration for user_id, registration in state.get("registrations", {}).items()}
+    )
+    USER_CARTS.update(
+        {int(user_id): cart for user_id, cart in state.get("carts", {}).items()}
+    )
+
+
+def save_state():
+    state = {
+        "registrations": {str(user_id): registration for user_id, registration in USER_REGISTRATIONS.items()},
+        "carts": {str(user_id): cart for user_id, cart in USER_CARTS.items()},
+    }
+    temp_file = f"{STATE_FILE}.tmp"
+
+    try:
+        with open(temp_file, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file, ensure_ascii=False, indent=2)
+        os.replace(temp_file, STATE_FILE)
+    except OSError as error:
+        print(f"Не удалось сохранить {STATE_FILE}: {error}")
+
+
 def get_user_cart(user_id: int) -> list[dict]:
     return USER_CARTS.setdefault(user_id, [])
 
@@ -557,6 +593,7 @@ async def calculate_pending_files(message: Message, state: FSMContext):
 
     USER_LAST_CALCULATIONS[user_id] = calculated_items
     get_user_cart(user_id).extend(item.copy() for item in calculated_items)
+    save_state()
     await message.answer(
         f"{format_calculation_summary(calculated_items, errors)}\n\n✅ Добавлено в корзину.",
         reply_markup=cart_keyboard,
@@ -574,6 +611,7 @@ async def ask_to_confirm_bank_details(message: Message, state: FSMContext, bank_
 
 async def complete_registration(message: Message, state: FSMContext, registration_data: dict):
     USER_REGISTRATIONS[message.from_user.id] = registration_data
+    save_state()
     print(registration_data)
 
     await message.answer(
@@ -661,6 +699,7 @@ async def remove_cart_item(message: Message, state: FSMContext):
         return
 
     removed_item = cart.pop(cart_index)
+    save_state()
     await message.answer(
         f"🗑 Удалено: {removed_item['file_name']}\n\n{format_cart(message.from_user.id)}",
         reply_markup=cart_keyboard if cart else help_keyboard,
@@ -748,6 +787,7 @@ async def confirm_cart_material_change(message: Message, state: FSMContext):
 
     cart[cart_index]["material_category"] = data.get("material_category")
     cart[cart_index]["material_subcategory"] = data.get("material_subcategory")
+    save_state()
 
     await message.answer(
         f"✅ Материал обновлен.\n\n{format_cart(message.from_user.id)}",
@@ -1097,6 +1137,7 @@ async def confirm_material_again(message: Message):
 
 
 async def main():
+    load_state()
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Начать регистрацию"),
