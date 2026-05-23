@@ -29,6 +29,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 PRICE_PER_CM3 = 850
+MIN_ORDER_PRICE = 400
 USER_REGISTRATIONS = {}
 USER_LAST_CALCULATIONS = {}
 USER_CARTS = {}
@@ -57,7 +58,7 @@ HELP_TEXT = """📘 Краткая инструкция
 Расчет:
 • базовая цена — 850 руб./см3;
 • если объем больше 5 см3 — 650 руб./см3;
-• минимальная стоимость — 400 руб.
+• минимальная стоимость общего заказа — 400 руб.
 
 В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
 Поддерживаемый файл: .stl"""
@@ -325,10 +326,14 @@ def calculate_model_price(volume_cm3: float) -> tuple[float, int]:
         price_per_cm3 = 650
 
     price = volume_cm3 * price_per_cm3
-    if price < 400:
-        price = 400
-
     return price, price_per_cm3
+
+
+def calculate_order_total(items: list[dict]) -> float:
+    total = sum(item["price"] for item in items)
+    if total and total < MIN_ORDER_PRICE:
+        return MIN_ORDER_PRICE
+    return total
 
 
 def safe_file_name(file_name: str) -> str:
@@ -350,9 +355,7 @@ def format_cart(user_id: int) -> str:
         )
 
     lines = ["🛒 Корзина", ""]
-    total = 0.0
     for index, item in enumerate(cart, start=1):
-        total += item["price"]
         lines.extend(
             [
                 f"{index}. {item['file_name']}",
@@ -363,15 +366,13 @@ def format_cart(user_id: int) -> str:
             ]
         )
 
-    lines.append(f"Итого до доставки: {format_money(total)}")
+    lines.append(f"Итого до доставки: {format_money(calculate_order_total(cart))}")
     return "\n".join(lines)
 
 
 def format_calculation_summary(items: list[dict], errors: list[str] | None = None) -> str:
     lines = ["🧮 Расчет готов", ""]
-    total = 0.0
     for index, item in enumerate(items, start=1):
-        total += item["price"]
         lines.extend(
             [
                 f"{index}. {item['file_name']}",
@@ -383,7 +384,7 @@ def format_calculation_summary(items: list[dict], errors: list[str] | None = Non
             ]
         )
 
-    lines.append(f"Итого до доставки: {format_money(total)}")
+    lines.append(f"Итого до доставки: {format_money(calculate_order_total(items))}")
 
     if errors:
         lines.extend(["", "Не удалось обработать:"])
@@ -527,9 +528,8 @@ async def calculate_pending_files(message: Message, state: FSMContext):
 
     USER_LAST_CALCULATIONS[user_id] = calculated_items
     get_user_cart(user_id).extend(item.copy() for item in calculated_items)
-    await message.answer(format_calculation_summary(calculated_items, errors))
     await message.answer(
-        f"✅ Рассчитанные модели добавлены в корзину.\n\n{format_cart(user_id)}",
+        f"{format_calculation_summary(calculated_items, errors)}\n\n✅ Добавлено в корзину.",
         reply_markup=cart_keyboard,
     )
 
