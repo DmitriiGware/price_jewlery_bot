@@ -650,6 +650,14 @@ async def add_more_button(message: Message, state: FSMContext):
 async def start(message: Message, state: FSMContext):
     USER_PENDING_FILES.pop(message.from_user.id, None)
     await state.clear()
+
+    if message.from_user.id in USER_REGISTRATIONS:
+        await message.answer(
+            "✅ Вы уже зарегистрированы.\n📎 Загружайте .stl файлы по одному, после каждого выбирайте материал, затем нажмите «🧮 Сделать расчет».",
+            reply_markup=upload_keyboard,
+        )
+        return
+
     await message.answer(
         "👋 Выберите тип клиента:",
         reply_markup=customer_type_keyboard,
