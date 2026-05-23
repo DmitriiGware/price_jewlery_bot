@@ -37,6 +37,8 @@ USER_PENDING_FILES = {}
 HELP_BUTTON_TEXT = "/help"
 CART_COMMAND = "cart"
 CART_BUTTON_TEXT = "🛒 Корзина"
+ADD_MORE_COMMAND = "add_more"
+ADD_MORE_BUTTON_TEXT = "➕ Добавить еще"
 CALCULATE_BUTTON_TEXT = "🧮 Сделать расчет"
 CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
 REMOVE_CART_ITEM_TEXT = "🗑 Удалить объект"
@@ -45,6 +47,7 @@ HELP_TEXT = """📘 Краткая инструкция
 /start — начать регистрацию заново.
 /help — показать эту справку.
 /cart — открыть корзину. Также можно нажать кнопку «🛒 Корзина».
+/add_more — добавить еще STL-файлы к заказу.
 
 Как пользоваться ботом:
 1. Нажмите /start и выберите тип клиента.
@@ -61,6 +64,7 @@ HELP_TEXT = """📘 Краткая инструкция
 • минимальная стоимость общего заказа — 400 руб.
 
 В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
+После формирования корзины можно нажать «➕ Добавить еще» и загрузить дополнительные файлы.
 Поддерживаемый файл: .stl"""
 
 
@@ -199,6 +203,7 @@ help_keyboard = ReplyKeyboardMarkup(
 
 cart_keyboard = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text=ADD_MORE_BUTTON_TEXT)],
         [
             KeyboardButton(text=CHANGE_CART_MATERIAL_TEXT),
             KeyboardButton(text=REMOVE_CART_ITEM_TEXT),
@@ -429,11 +434,34 @@ def is_cart_request(text: str | None) -> bool:
     }
 
 
+def is_add_more_request(text: str | None) -> bool:
+    return normalize_text(text).lower() in {
+        "добавить еще",
+        "добавить ещё",
+        "/dobavit",
+        "/add",
+        f"/{ADD_MORE_COMMAND}",
+        ADD_MORE_BUTTON_TEXT.lower(),
+    }
+
+
 async def send_cart(message: Message):
     cart = get_user_cart(message.from_user.id)
     await message.answer(
         format_cart(message.from_user.id),
         reply_markup=cart_keyboard if cart else help_keyboard,
+    )
+
+
+async def ask_to_upload_more(message: Message, state: FSMContext):
+    if message.from_user.id not in USER_REGISTRATIONS:
+        await message.answer("📝 Сначала пройдите регистрацию через /start.", reply_markup=help_keyboard)
+        return
+
+    await state.clear()
+    await message.answer(
+        "📎 Загружайте новые .stl файлы по одному. После каждого файла выберите материал, затем нажмите «🧮 Сделать расчет».",
+        reply_markup=upload_keyboard,
     )
 
 
@@ -568,6 +596,16 @@ async def cart_command(message: Message):
 @dp.message(lambda message: is_cart_request(message.text))
 async def cart_button(message: Message):
     await send_cart(message)
+
+
+@dp.message(Command(ADD_MORE_COMMAND))
+async def add_more_command(message: Message, state: FSMContext):
+    await ask_to_upload_more(message, state)
+
+
+@dp.message(lambda message: is_add_more_request(message.text))
+async def add_more_button(message: Message, state: FSMContext):
+    await ask_to_upload_more(message, state)
 
 
 @dp.message(CommandStart())
@@ -1064,6 +1102,7 @@ async def main():
             BotCommand(command="start", description="Начать регистрацию"),
             BotCommand(command="help", description="Краткая инструкция"),
             BotCommand(command=CART_COMMAND, description="Открыть корзину"),
+            BotCommand(command=ADD_MORE_COMMAND, description="Добавить еще файлы"),
         ]
     )
     await dp.start_polling(bot)
