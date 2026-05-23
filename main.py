@@ -402,6 +402,13 @@ def format_pending_file_material_prompt(pending_files: list[dict], item_index: i
     )
 
 
+def find_pending_file_without_material(pending_files: list[dict]) -> int | None:
+    for index, pending_file in enumerate(pending_files):
+        if not pending_file.get("material_category") or not pending_file.get("material_subcategory"):
+            return index
+    return None
+
+
 def parse_cart_index(text: str | None, cart: list[dict]) -> int | None:
     try:
         index = int(normalize_text(text))
@@ -466,18 +473,12 @@ async def calculate_pending_files(message: Message, state: FSMContext):
         )
         return
 
-    files_without_material = [
-        pending_file["file_name"]
-        for pending_file in pending_files
-        if not pending_file.get("material_category") or not pending_file.get("material_subcategory")
-    ]
-    if files_without_material:
+    file_without_material_index = find_pending_file_without_material(pending_files)
+    if file_without_material_index is not None:
         await message.answer(
-            "💍 Сначала выберите материал для каждого файла.\n\n"
-            "Без материала:\n"
-            + "\n".join(f"• {file_name}" for file_name in files_without_material),
-            reply_markup=upload_keyboard,
+            "💍 Сначала выберем материал для файлов, где он еще не указан."
         )
+        await ask_material_for_pending_file(message, state, file_without_material_index)
         return
 
     await state.clear()
@@ -1018,6 +1019,16 @@ async def confirm_material(message: Message, state: FSMContext):
 
     pending_files[pending_file_index]["material_category"] = category
     pending_files[pending_file_index]["material_subcategory"] = subcategory
+
+    next_file_without_material_index = find_pending_file_without_material(pending_files)
+    if next_file_without_material_index is not None:
+        await message.answer(
+            "✅ Материал сохранен для файла:\n"
+            f"{pending_files[pending_file_index]['file_name']}\n"
+            f"{format_material(category, subcategory)}"
+        )
+        await ask_material_for_pending_file(message, state, next_file_without_material_index)
+        return
 
     await message.answer(
         "✅ Материал сохранен для файла:\n"
