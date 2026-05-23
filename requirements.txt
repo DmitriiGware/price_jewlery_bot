@@ -5,3 +5,4 @@ trimesh
 numpy
 scipy
 networkx
+aiohttp==3.9.5
