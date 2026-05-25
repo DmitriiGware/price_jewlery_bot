@@ -21,6 +21,7 @@ def clean_secret(value: str | None) -> str:
 
 TOKEN = clean_secret(os.getenv("BOT_TOKEN"))
 DADATA_TOKEN = clean_secret(os.getenv("DADATA_TOKEN"))
+MANAGER_CHAT_ID = clean_secret(os.getenv("MANAGER_CHAT_ID"))
 DADATA_FIND_PARTY_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
 STATE_FILE = "bot_state.json"
 
@@ -36,12 +37,16 @@ USER_REGISTRATIONS = {}
 USER_LAST_CALCULATIONS = {}
 USER_CARTS = {}
 USER_DELIVERIES = {}
+USER_ORDER_NUMBERS = {}
 USER_PENDING_FILES = {}
+ORDER_COUNTER = {"next": 1}
 HELP_BUTTON_TEXT = "/help"
 CART_COMMAND = "cart"
 CART_BUTTON_TEXT = "🛒 Корзина"
 ADD_MORE_COMMAND = "add_more"
 ADD_MORE_BUTTON_TEXT = "➕ Добавить еще"
+SEND_ORDER_COMMAND = "send_order"
+SEND_ORDER_TEXT = "📨 Отправить заказ менеджеру"
 CALCULATE_BUTTON_TEXT = "🧮 Сделать расчет"
 CHOOSE_DELIVERY_TEXT = "🚚 Выбрать доставку"
 CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
@@ -60,6 +65,7 @@ HELP_TEXT = """📘 Краткая инструкция
 /help — показать эту справку.
 /cart — открыть корзину. Также можно нажать кнопку «🛒 Корзина».
 /add_more — добавить еще STL-файлы к заказу.
+/send_order — отправить оформленный заказ менеджеру.
 
 Как пользоваться ботом:
 1. Нажмите /start и выберите тип клиента.
@@ -132,14 +138,17 @@ MATERIAL_OPTIONS = {
 DELIVERY_OPTIONS = [
     {
         "text": "Москва, Хорошёвское шоссе, 16, стр. 3",
+        "button_text": "Москва, Хорошёвское шоссе, 16, стр. 3 (беспл.)",
         "price": 0,
     },
     {
         "text": "Москва, проспект Мира, 95, стр. 1",
+        "button_text": "Москва, проспект Мира, 95, стр. 1 (беспл.)",
         "price": 0,
     },
     {
         "text": "Москва, Скаковая улица, 36",
+        "button_text": "Москва, Скаковая улица, 36 (беспл.)",
         "price": 0,
     },
 ]
@@ -235,6 +244,7 @@ help_keyboard = ReplyKeyboardMarkup(
 
 cart_keyboard = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text=SEND_ORDER_TEXT)],
         [
             KeyboardButton(text=ADD_MORE_BUTTON_TEXT),
             KeyboardButton(text=CHOOSE_DELIVERY_TEXT),
@@ -258,7 +268,7 @@ upload_keyboard = ReplyKeyboardMarkup(
 
 delivery_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=option["text"])]
+        [KeyboardButton(text=option["button_text"])]
         for option in DELIVERY_OPTIONS
     ] + [
         [KeyboardButton(text=PICKUP_TEXT)],
@@ -380,6 +390,11 @@ def load_state():
     USER_DELIVERIES.update(
         {int(user_id): delivery for user_id, delivery in state.get("deliveries", {}).items()}
     )
+    USER_ORDER_NUMBERS.update(
+        {int(user_id): order_number for user_id, order_number in state.get("order_numbers", {}).items()}
+    )
+    max_order_number = max(USER_ORDER_NUMBERS.values(), default=0)
+    ORDER_COUNTER["next"] = max(int(state.get("next_order_number", 1)), max_order_number + 1)
 
 
 def save_state():
@@ -387,6 +402,8 @@ def save_state():
         "registrations": {str(user_id): registration for user_id, registration in USER_REGISTRATIONS.items()},
         "carts": {str(user_id): cart for user_id, cart in USER_CARTS.items()},
         "deliveries": {str(user_id): delivery for user_id, delivery in USER_DELIVERIES.items()},
+        "order_numbers": {str(user_id): order_number for user_id, order_number in USER_ORDER_NUMBERS.items()},
+        "next_order_number": ORDER_COUNTER["next"],
     }
     temp_file = f"{STATE_FILE}.tmp"
 
@@ -396,6 +413,25 @@ def save_state():
         os.replace(temp_file, STATE_FILE)
     except OSError as error:
         print(f"Не удалось сохранить {STATE_FILE}: {error}")
+
+
+def issue_order_number() -> int:
+    order_number = ORDER_COUNTER["next"]
+    ORDER_COUNTER["next"] += 1
+    return order_number
+
+
+def ensure_user_order_number(user_id: int) -> int:
+    if user_id not in USER_ORDER_NUMBERS:
+        USER_ORDER_NUMBERS[user_id] = issue_order_number()
+    return USER_ORDER_NUMBERS[user_id]
+
+
+def format_order_number(user_id: int) -> str:
+    order_number = USER_ORDER_NUMBERS.get(user_id)
+    if not order_number:
+        return "не присвоен"
+    return f"№{order_number:06d}"
 
 
 def get_user_cart(user_id: int) -> list[dict]:
@@ -409,7 +445,7 @@ def get_user_pending_files(user_id: int) -> list[dict]:
 def get_delivery_option(text: str | None) -> dict | None:
     normalized_text = normalize_text(text)
     for option in DELIVERY_OPTIONS:
-        if option["text"] == normalized_text:
+        if option["text"] == normalized_text or option["button_text"] == normalized_text:
             return option
     return None
 
@@ -458,6 +494,32 @@ def format_delivery(user_id: int) -> str:
     return f"{delivery.get('address')} ({price_text})"
 
 
+def format_registration_summary(registration: dict) -> str:
+    customer_type = registration.get("customer_type")
+    if customer_type == "private":
+        return "\n".join(
+            [
+                "Тип клиента: физическое лицо",
+                f"Имя: {registration.get('name', 'не указано')}",
+                f"Телефон: {registration.get('phone', 'не указан')}",
+                f"Email: {registration.get('email', 'не указан')}",
+            ]
+        )
+
+    if customer_type == "company":
+        company = registration.get("company") or {}
+        return "\n".join(
+            [
+                "Тип клиента: юридическое лицо",
+                f"ИНН: {registration.get('inn', 'не указан')}",
+                f"Компания: {company.get('name', 'не указана')}",
+                f"Реквизиты: {limit_text(registration.get('bank_details', 'не указаны'), 800)}",
+            ]
+        )
+
+    return "Тип клиента: не указан"
+
+
 def format_cart(user_id: int) -> str:
     cart = get_user_cart(user_id)
     if not cart:
@@ -466,7 +528,10 @@ def format_cart(user_id: int) -> str:
             "Загрузите .stl файл после регистрации, выберите материал — и модель появится здесь."
         )
 
-    lines = ["🛒 Корзина", ""]
+    lines = ["🛒 Корзина"]
+    if user_id in USER_ORDER_NUMBERS:
+        lines.append(f"Заказ {format_order_number(user_id)}")
+    lines.append("")
     for index, item in enumerate(cart, start=1):
         lines.extend(
             [
@@ -490,8 +555,9 @@ def format_manager_order_summary(user_id: int) -> str:
     lines = [
         "Сводка заказа для менеджера",
         "",
+        f"Заказ: {format_order_number(user_id)}",
         f"Telegram ID: {user_id}",
-        f"Тип клиента: {registration.get('customer_type', 'не указан')}",
+        format_registration_summary(registration),
         f"Доставка: {format_delivery(user_id)}",
         "",
         format_cart(user_id),
@@ -612,6 +678,52 @@ async def save_delivery(message: Message, state: FSMContext, address: str, price
     await state.clear()
     await message.answer(
         f"✅ Адрес доставки сохранен:\n{format_delivery(message.from_user.id)}\n\n{format_cart(message.from_user.id)}",
+        reply_markup=cart_keyboard,
+    )
+
+
+async def send_order_to_manager(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not get_user_cart(user_id):
+        await message.answer("Сначала добавьте модели в корзину.", reply_markup=upload_keyboard)
+        return
+
+    if user_id not in USER_DELIVERIES:
+        await message.answer("Сначала выберите доставку или самовывоз.", reply_markup=delivery_keyboard)
+        await state.set_state(DeliverySelection.waiting_custom_address)
+        return
+
+    if not MANAGER_CHAT_ID:
+        await message.answer(
+            "Не настроен MANAGER_CHAT_ID в .env, поэтому я пока не могу отправить заказ менеджеру.",
+            reply_markup=cart_keyboard,
+        )
+        return
+
+    had_order_number = user_id in USER_ORDER_NUMBERS
+    if not had_order_number:
+        USER_ORDER_NUMBERS[user_id] = ORDER_COUNTER["next"]
+
+    summary = format_manager_order_summary(user_id)
+
+    try:
+        await bot.send_message(MANAGER_CHAT_ID, summary)
+    except Exception as error:
+        if not had_order_number:
+            USER_ORDER_NUMBERS.pop(user_id, None)
+        await message.answer(
+            f"Не удалось отправить заказ менеджеру.\nОшибка: {error}",
+            reply_markup=cart_keyboard,
+        )
+        return
+
+    if not had_order_number:
+        ORDER_COUNTER["next"] += 1
+    save_state()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Заказ {format_order_number(user_id)} отправлен менеджеру.",
         reply_markup=cart_keyboard,
     )
 
@@ -762,6 +874,16 @@ async def add_more_button(message: Message, state: FSMContext):
     await ask_to_upload_more(message, state)
 
 
+@dp.message(Command(SEND_ORDER_COMMAND))
+async def send_order_command(message: Message, state: FSMContext):
+    await send_order_to_manager(message, state)
+
+
+@dp.message(F.text == SEND_ORDER_TEXT)
+async def send_order_button(message: Message, state: FSMContext):
+    await send_order_to_manager(message, state)
+
+
 @dp.message(F.text == CHOOSE_DELIVERY_TEXT)
 async def choose_delivery_from_cart(message: Message, state: FSMContext):
     if not get_user_cart(message.from_user.id):
@@ -790,7 +912,7 @@ async def start(message: Message, state: FSMContext):
     await state.set_state(Registration.choosing_customer_type)
 
 
-@dp.message(F.text.in_([option["text"] for option in DELIVERY_OPTIONS]))
+@dp.message(F.text.in_([option["button_text"] for option in DELIVERY_OPTIONS]))
 async def choose_known_delivery_address(message: Message, state: FSMContext):
     option = get_delivery_option(message.text)
     if not option:
@@ -886,6 +1008,7 @@ async def remove_cart_item(message: Message, state: FSMContext):
     removed_item = cart.pop(cart_index)
     if not cart:
         USER_DELIVERIES.pop(message.from_user.id, None)
+        USER_ORDER_NUMBERS.pop(message.from_user.id, None)
     save_state()
     await message.answer(
         f"🗑 Удалено: {removed_item['file_name']}\n\n{format_cart(message.from_user.id)}",
@@ -1331,6 +1454,7 @@ async def main():
             BotCommand(command="help", description="Краткая инструкция"),
             BotCommand(command=CART_COMMAND, description="Открыть корзину"),
             BotCommand(command=ADD_MORE_COMMAND, description="Добавить еще файлы"),
+            BotCommand(command=SEND_ORDER_COMMAND, description="Отправить заказ менеджеру"),
         ]
     )
     await dp.start_polling(bot)
