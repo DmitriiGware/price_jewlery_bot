@@ -35,6 +35,7 @@ MIN_ORDER_PRICE = 400
 USER_REGISTRATIONS = {}
 USER_LAST_CALCULATIONS = {}
 USER_CARTS = {}
+USER_DELIVERIES = {}
 USER_PENDING_FILES = {}
 HELP_BUTTON_TEXT = "/help"
 CART_COMMAND = "cart"
@@ -42,8 +43,17 @@ CART_BUTTON_TEXT = "🛒 Корзина"
 ADD_MORE_COMMAND = "add_more"
 ADD_MORE_BUTTON_TEXT = "➕ Добавить еще"
 CALCULATE_BUTTON_TEXT = "🧮 Сделать расчет"
+CHOOSE_DELIVERY_TEXT = "🚚 Выбрать доставку"
 CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
 REMOVE_CART_ITEM_TEXT = "🗑 Удалить объект"
+OTHER_DELIVERY_TEXT = "Другое (800 рублей)"
+PICKUP_ADDRESS = "Москва, улица Академика Арцимовича, 13"
+PICKUP_TEXT = f"Самовывоз — {PICKUP_ADDRESS}"
+DELIVERY_PROMPT = (
+    "Для оформления доставки и оплаты заказа, выберите адрес доставки или введите Ваш "
+    "по кнопке ниже (800 рублей в пределах мкада)\n\n"
+    f"Для оформления самовывоза по адресу \"{PICKUP_ADDRESS}\" нажмите соответствующую кнопку ниже"
+)
 HELP_TEXT = """📘 Краткая инструкция
 
 /start — начать регистрацию заново.
@@ -67,6 +77,7 @@ HELP_TEXT = """📘 Краткая инструкция
 
 В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
 После формирования корзины можно нажать «➕ Добавить еще» и загрузить дополнительные файлы.
+После расчета выберите адрес доставки: известные адреса бесплатные, другой адрес — 800 руб. в пределах МКАД.
 Поддерживаемый файл: .stl"""
 
 
@@ -96,6 +107,10 @@ class CartManagement(StatesGroup):
     confirming_material_change = State()
 
 
+class DeliverySelection(StatesGroup):
+    waiting_custom_address = State()
+
+
 MATERIAL_OPTIONS = {
     "🥈 Серебро": [
         "925 проба",
@@ -113,6 +128,21 @@ MATERIAL_OPTIONS = {
         "950 проба",
     ],
 }
+
+DELIVERY_OPTIONS = [
+    {
+        "text": "Москва, Хорошёвское шоссе, 16, стр. 3",
+        "price": 0,
+    },
+    {
+        "text": "Москва, проспект Мира, 95, стр. 1",
+        "price": 0,
+    },
+    {
+        "text": "Москва, Скаковая улица, 36",
+        "price": 0,
+    },
+]
 
 
 def service_keyboard_row() -> list[KeyboardButton]:
@@ -205,7 +235,10 @@ help_keyboard = ReplyKeyboardMarkup(
 
 cart_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=ADD_MORE_BUTTON_TEXT)],
+        [
+            KeyboardButton(text=ADD_MORE_BUTTON_TEXT),
+            KeyboardButton(text=CHOOSE_DELIVERY_TEXT),
+        ],
         [
             KeyboardButton(text=CHANGE_CART_MATERIAL_TEXT),
             KeyboardButton(text=REMOVE_CART_ITEM_TEXT),
@@ -218,6 +251,18 @@ cart_keyboard = ReplyKeyboardMarkup(
 upload_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=CALCULATE_BUTTON_TEXT)],
+        service_keyboard_row(),
+    ],
+    resize_keyboard=True,
+)
+
+delivery_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=option["text"])]
+        for option in DELIVERY_OPTIONS
+    ] + [
+        [KeyboardButton(text=PICKUP_TEXT)],
+        [KeyboardButton(text=OTHER_DELIVERY_TEXT)],
         service_keyboard_row(),
     ],
     resize_keyboard=True,
@@ -332,12 +377,16 @@ def load_state():
     USER_CARTS.update(
         {int(user_id): cart for user_id, cart in state.get("carts", {}).items()}
     )
+    USER_DELIVERIES.update(
+        {int(user_id): delivery for user_id, delivery in state.get("deliveries", {}).items()}
+    )
 
 
 def save_state():
     state = {
         "registrations": {str(user_id): registration for user_id, registration in USER_REGISTRATIONS.items()},
         "carts": {str(user_id): cart for user_id, cart in USER_CARTS.items()},
+        "deliveries": {str(user_id): delivery for user_id, delivery in USER_DELIVERIES.items()},
     }
     temp_file = f"{STATE_FILE}.tmp"
 
@@ -355,6 +404,14 @@ def get_user_cart(user_id: int) -> list[dict]:
 
 def get_user_pending_files(user_id: int) -> list[dict]:
     return USER_PENDING_FILES.setdefault(user_id, [])
+
+
+def get_delivery_option(text: str | None) -> dict | None:
+    normalized_text = normalize_text(text)
+    for option in DELIVERY_OPTIONS:
+        if option["text"] == normalized_text:
+            return option
+    return None
 
 
 def format_money(value: float) -> str:
@@ -377,6 +434,10 @@ def calculate_order_total(items: list[dict]) -> float:
     return total
 
 
+def calculate_order_total_with_delivery(user_id: int) -> float:
+    return calculate_order_total(get_user_cart(user_id)) + USER_DELIVERIES.get(user_id, {}).get("price", 0)
+
+
 def safe_file_name(file_name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in file_name)
 
@@ -385,6 +446,16 @@ def format_material(category: str | None, subcategory: str | None) -> str:
     if category and subcategory:
         return f"{category}, {subcategory}"
     return "не выбран"
+
+
+def format_delivery(user_id: int) -> str:
+    delivery = USER_DELIVERIES.get(user_id)
+    if not delivery:
+        return "не выбран"
+
+    price = delivery.get("price", 0)
+    price_text = "бесплатно" if price == 0 else format_money(price)
+    return f"{delivery.get('address')} ({price_text})"
 
 
 def format_cart(user_id: int) -> str:
@@ -408,6 +479,23 @@ def format_cart(user_id: int) -> str:
         )
 
     lines.append(f"Итого до доставки: {format_money(calculate_order_total(cart))}")
+    lines.append(f"Доставка: {format_delivery(user_id)}")
+    if user_id in USER_DELIVERIES:
+        lines.append(f"Итого с доставкой: {format_money(calculate_order_total_with_delivery(user_id))}")
+    return "\n".join(lines)
+
+
+def format_manager_order_summary(user_id: int) -> str:
+    registration = USER_REGISTRATIONS.get(user_id, {})
+    lines = [
+        "Сводка заказа для менеджера",
+        "",
+        f"Telegram ID: {user_id}",
+        f"Тип клиента: {registration.get('customer_type', 'не указан')}",
+        f"Доставка: {format_delivery(user_id)}",
+        "",
+        format_cart(user_id),
+    ]
     return "\n".join(lines)
 
 
@@ -498,6 +586,33 @@ async def ask_to_upload_more(message: Message, state: FSMContext):
     await message.answer(
         "📎 Загружайте новые .stl файлы по одному. После каждого файла выберите материал, затем нажмите «🧮 Сделать расчет».",
         reply_markup=upload_keyboard,
+    )
+
+
+async def ask_delivery_address(message: Message, state: FSMContext):
+    await message.answer(
+        DELIVERY_PROMPT,
+        reply_markup=delivery_keyboard,
+    )
+    await state.set_state(DeliverySelection.waiting_custom_address)
+
+
+async def save_delivery(message: Message, state: FSMContext, address: str, price: int, kind: str):
+    if not get_user_cart(message.from_user.id):
+        await message.answer("Сначала добавьте модели в корзину.", reply_markup=upload_keyboard)
+        await state.clear()
+        return
+
+    USER_DELIVERIES[message.from_user.id] = {
+        "address": address,
+        "price": price,
+        "kind": kind,
+    }
+    save_state()
+    await state.clear()
+    await message.answer(
+        f"✅ Адрес доставки сохранен:\n{format_delivery(message.from_user.id)}\n\n{format_cart(message.from_user.id)}",
+        reply_markup=cart_keyboard,
     )
 
 
@@ -595,9 +710,10 @@ async def calculate_pending_files(message: Message, state: FSMContext):
     get_user_cart(user_id).extend(item.copy() for item in calculated_items)
     save_state()
     await message.answer(
-        f"{format_calculation_summary(calculated_items, errors)}\n\n✅ Добавлено в корзину.",
-        reply_markup=cart_keyboard,
+        f"{format_calculation_summary(calculated_items, errors)}\n\n✅ Добавлено в корзину.\n\n{DELIVERY_PROMPT}",
+        reply_markup=delivery_keyboard,
     )
+    await state.set_state(DeliverySelection.waiting_custom_address)
 
 
 async def ask_to_confirm_bank_details(message: Message, state: FSMContext, bank_details: str):
@@ -646,6 +762,15 @@ async def add_more_button(message: Message, state: FSMContext):
     await ask_to_upload_more(message, state)
 
 
+@dp.message(F.text == CHOOSE_DELIVERY_TEXT)
+async def choose_delivery_from_cart(message: Message, state: FSMContext):
+    if not get_user_cart(message.from_user.id):
+        await message.answer("Сначала добавьте модели в корзину.", reply_markup=upload_keyboard)
+        return
+
+    await ask_delivery_address(message, state)
+
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     USER_PENDING_FILES.pop(message.from_user.id, None)
@@ -663,6 +788,58 @@ async def start(message: Message, state: FSMContext):
         reply_markup=customer_type_keyboard,
     )
     await state.set_state(Registration.choosing_customer_type)
+
+
+@dp.message(F.text.in_([option["text"] for option in DELIVERY_OPTIONS]))
+async def choose_known_delivery_address(message: Message, state: FSMContext):
+    option = get_delivery_option(message.text)
+    if not option:
+        await ask_delivery_address(message, state)
+        return
+
+    await save_delivery(
+        message=message,
+        state=state,
+        address=option["text"],
+        price=option["price"],
+        kind="known",
+    )
+
+
+@dp.message(F.text == OTHER_DELIVERY_TEXT)
+async def choose_custom_delivery_address(message: Message, state: FSMContext):
+    await message.answer(
+        "Введите адрес доставки в пределах МКАД:",
+        reply_markup=help_keyboard,
+    )
+    await state.set_state(DeliverySelection.waiting_custom_address)
+
+
+@dp.message(F.text == PICKUP_TEXT)
+async def choose_pickup(message: Message, state: FSMContext):
+    await save_delivery(
+        message=message,
+        state=state,
+        address=PICKUP_ADDRESS,
+        price=0,
+        kind="pickup",
+    )
+
+
+@dp.message(DeliverySelection.waiting_custom_address)
+async def get_custom_delivery_address(message: Message, state: FSMContext):
+    address = normalize_text(message.text)
+    if not address:
+        await message.answer("Введите адрес доставки текстом:", reply_markup=help_keyboard)
+        return
+
+    await save_delivery(
+        message=message,
+        state=state,
+        address=address,
+        price=800,
+        kind="custom",
+    )
 
 
 @dp.message(F.text == CALCULATE_BUTTON_TEXT)
@@ -707,6 +884,8 @@ async def remove_cart_item(message: Message, state: FSMContext):
         return
 
     removed_item = cart.pop(cart_index)
+    if not cart:
+        USER_DELIVERIES.pop(message.from_user.id, None)
     save_state()
     await message.answer(
         f"🗑 Удалено: {removed_item['file_name']}\n\n{format_cart(message.from_user.id)}",
