@@ -565,6 +565,32 @@ def format_manager_order_summary(user_id: int) -> str:
     return "\n".join(lines)
 
 
+async def send_order_files_to_manager(user_id: int):
+    cart = get_user_cart(user_id)
+    order_number = format_order_number(user_id)
+    missing_files = []
+
+    for index, item in enumerate(cart, start=1):
+        file_id = item.get("file_id")
+        file_name = item.get("file_name", f"file_{index}.stl")
+        if not file_id:
+            missing_files.append(file_name)
+            continue
+
+        await bot.send_document(
+            MANAGER_CHAT_ID,
+            file_id,
+            caption=f"{order_number} — файл {index}/{len(cart)}: {file_name}",
+        )
+
+    if missing_files:
+        await bot.send_message(
+            MANAGER_CHAT_ID,
+            "Не удалось прикрепить файлы без сохраненного file_id:\n"
+            + "\n".join(f"• {file_name}" for file_name in missing_files),
+        )
+
+
 def format_calculation_summary(items: list[dict], errors: list[str] | None = None) -> str:
     lines = ["🧮 Расчет готов", ""]
     for index, item in enumerate(items, start=1):
@@ -708,6 +734,7 @@ async def send_order_to_manager(message: Message, state: FSMContext):
 
     try:
         await bot.send_message(MANAGER_CHAT_ID, summary)
+        await send_order_files_to_manager(user_id)
     except Exception as error:
         if not had_order_number:
             USER_ORDER_NUMBERS.pop(user_id, None)
@@ -795,6 +822,7 @@ async def calculate_pending_files(message: Message, state: FSMContext):
             calculated_items.append(
                 {
                     "file_name": file_name,
+                    "file_id": pending_file.get("file_id"),
                     "volume_mm3": volume_mm3,
                     "volume_cm3": volume_cm3,
                     "price": price,
