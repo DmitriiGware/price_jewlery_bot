@@ -5,6 +5,8 @@ import os
 import aiohttp
 import trimesh
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -22,13 +24,33 @@ def clean_secret(value: str | None) -> str:
 TOKEN = clean_secret(os.getenv("BOT_TOKEN"))
 DADATA_TOKEN = clean_secret(os.getenv("DADATA_TOKEN"))
 MANAGER_CHAT_ID = clean_secret(os.getenv("MANAGER_CHAT_ID"))
+PRIVATE_ORDERS_SHEET_ID = clean_secret(os.getenv("PRIVATE_ORDERS_SHEET_ID"))
+COMPANY_ORDERS_SHEET_ID = clean_secret(os.getenv("COMPANY_ORDERS_SHEET_ID"))
+TELEGRAM_API_BASE_URL = clean_secret(os.getenv("TELEGRAM_API_BASE_URL"))
+TELEGRAM_API_LOCAL_MODE = clean_secret(
+    os.getenv("TELEGRAM_API_LOCAL_MODE") or os.getenv("TELEGRAM_API_IS_LOCAL")
+).lower() in ("1", "true", "yes", "да")
 DADATA_FIND_PARTY_URL = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
 STATE_FILE = "bot_state.json"
+TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB = 20
 
 if not TOKEN:
     raise RuntimeError("Заполните BOT_TOKEN в файле .env")
 
-bot = Bot(token=TOKEN)
+
+def create_bot() -> Bot:
+    if not TELEGRAM_API_BASE_URL:
+        return Bot(token=TOKEN)
+
+    api_server = TelegramAPIServer.from_base(
+        TELEGRAM_API_BASE_URL,
+        is_local=TELEGRAM_API_LOCAL_MODE,
+    )
+    session = AiohttpSession(api=api_server)
+    return Bot(token=TOKEN, session=session)
+
+
+bot = create_bot()
 dp = Dispatcher()
 
 PRICE_PER_CM3 = 850
@@ -84,7 +106,8 @@ HELP_TEXT = """📘 Краткая инструкция
 В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
 После формирования корзины можно нажать «➕ Добавить еще» и загрузить дополнительные файлы.
 После расчета выберите адрес доставки: известные адреса бесплатные, другой адрес — 800 руб. в пределах МКАД.
-Поддерживаемый файл: .stl"""
+Поддерживаемый файл: .stl
+Большие STL-файлы поддерживаются при подключенном локальном Telegram Bot API сервере."""
 
 
 class Registration(StatesGroup):
@@ -151,6 +174,31 @@ DELIVERY_OPTIONS = [
         "button_text": "Москва, Скаковая улица, 36 (беспл.)",
         "price": 0,
     },
+]
+
+PRIVATE_ORDERS_SHEET_COLUMNS = [
+    "Номер заказа",
+    "Telegram ID",
+    "Имя",
+    "Телефон",
+    "Email",
+    "Количество предметов",
+    "Адрес доставки",
+    "Цена заказа",
+]
+
+COMPANY_ORDERS_SHEET_COLUMNS = [
+    "Номер заказа",
+    "Telegram ID",
+    "Имя",
+    "Телефон",
+    "Email",
+    "Количество предметов",
+    "Адрес доставки",
+    "Цена заказа",
+    "Компания",
+    "ИНН",
+    "Реквизиты компании",
 ]
 
 
@@ -442,6 +490,34 @@ def get_user_pending_files(user_id: int) -> list[dict]:
     return USER_PENDING_FILES.setdefault(user_id, [])
 
 
+def is_using_public_telegram_api() -> bool:
+    return not TELEGRAM_API_BASE_URL
+
+
+def is_too_large_for_public_telegram_api(file_size: int | None) -> bool:
+    return bool(
+        file_size
+        and is_using_public_telegram_api()
+        and file_size > TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB * 1024 * 1024
+    )
+
+
+def format_file_size(file_size: int | None) -> str:
+    if not file_size:
+        return "неизвестный размер"
+    return f"{file_size / 1024 / 1024:.1f} МБ"
+
+
+def large_file_setup_message(file_size: int | None = None) -> str:
+    size_text = f" ({format_file_size(file_size)})" if file_size else ""
+    return (
+        f"📎 Файл больше {TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB} МБ{size_text}.\n\n"
+        "Чтобы бот мог считать такие STL, на облаке нужно подключить локальный Telegram Bot API сервер "
+        "и указать TELEGRAM_API_BASE_URL в .env. После этого большие файлы можно будет загружать так же, "
+        "как обычные."
+    )
+
+
 def get_delivery_option(text: str | None) -> dict | None:
     normalized_text = normalize_text(text)
     for option in DELIVERY_OPTIONS:
@@ -472,6 +548,10 @@ def calculate_order_total(items: list[dict]) -> float:
 
 def calculate_order_total_with_delivery(user_id: int) -> float:
     return calculate_order_total(get_user_cart(user_id)) + USER_DELIVERIES.get(user_id, {}).get("price", 0)
+
+
+def should_show_item_prices(items: list[dict]) -> bool:
+    return len(items) > 1
 
 
 def safe_file_name(file_name: str) -> str:
@@ -532,16 +612,18 @@ def format_cart(user_id: int) -> str:
     if user_id in USER_ORDER_NUMBERS:
         lines.append(f"Заказ {format_order_number(user_id)}")
     lines.append("")
+    show_item_prices = should_show_item_prices(cart)
     for index, item in enumerate(cart, start=1):
         lines.extend(
             [
                 f"{index}. {item['file_name']}",
                 f"   Объем: {item['volume_cm3']:.3f} см3",
                 f"   Материал: {format_material(item.get('material_category'), item.get('material_subcategory'))}",
-                f"   Цена: {format_money(item['price'])}",
-                "",
             ]
         )
+        if show_item_prices:
+            lines.append(f"   Цена: {format_money(item['price'])}")
+        lines.append("")
 
     lines.append(f"Итого до доставки: {format_money(calculate_order_total(cart))}")
     lines.append(f"Доставка: {format_delivery(user_id)}")
@@ -563,6 +645,81 @@ def format_manager_order_summary(user_id: int) -> str:
         format_cart(user_id),
     ]
     return "\n".join(lines)
+
+
+def get_delivery_for_sheet(user_id: int) -> str:
+    delivery = USER_DELIVERIES.get(user_id)
+    if not delivery:
+        return ""
+    return format_delivery(user_id)
+
+
+def build_private_order_sheet_row(user_id: int) -> list:
+    registration = USER_REGISTRATIONS.get(user_id, {})
+    return [
+        format_order_number(user_id),
+        user_id,
+        registration.get("name", ""),
+        registration.get("phone", ""),
+        registration.get("email", ""),
+        len(get_user_cart(user_id)),
+        get_delivery_for_sheet(user_id),
+        format_money(calculate_order_total_with_delivery(user_id)),
+    ]
+
+
+def build_company_order_sheet_row(user_id: int) -> list:
+    registration = USER_REGISTRATIONS.get(user_id, {})
+    company = registration.get("company") or {}
+    return [
+        format_order_number(user_id),
+        user_id,
+        registration.get("name", ""),
+        registration.get("phone", ""),
+        registration.get("email", ""),
+        len(get_user_cart(user_id)),
+        get_delivery_for_sheet(user_id),
+        format_money(calculate_order_total_with_delivery(user_id)),
+        company.get("name", ""),
+        registration.get("inn", ""),
+        registration.get("bank_details", ""),
+    ]
+
+
+async def append_order_row_to_google_sheet(sheet_id: str, columns: list[str], row: list, table_name: str):
+    if not sheet_id:
+        print(f"Google Sheets заглушка: не указан ID таблицы для «{table_name}».")
+        print(dict(zip(columns, row)))
+        return
+
+    # TODO: Подключить Google Sheets API и append строки в таблицу sheet_id.
+    print(f"Google Sheets заглушка: готова строка для «{table_name}» ({sheet_id}).")
+    print(dict(zip(columns, row)))
+
+
+async def append_order_to_google_sheets(user_id: int):
+    registration = USER_REGISTRATIONS.get(user_id, {})
+    customer_type = registration.get("customer_type")
+
+    if customer_type == "private":
+        await append_order_row_to_google_sheet(
+            PRIVATE_ORDERS_SHEET_ID,
+            PRIVATE_ORDERS_SHEET_COLUMNS,
+            build_private_order_sheet_row(user_id),
+            "Частные лица",
+        )
+        return
+
+    if customer_type == "company":
+        await append_order_row_to_google_sheet(
+            COMPANY_ORDERS_SHEET_ID,
+            COMPANY_ORDERS_SHEET_COLUMNS,
+            build_company_order_sheet_row(user_id),
+            "Юридические лица",
+        )
+        return
+
+    print(f"Google Sheets заглушка: неизвестный тип клиента для пользователя {user_id}.")
 
 
 async def send_order_files_to_manager(user_id: int):
@@ -593,6 +750,7 @@ async def send_order_files_to_manager(user_id: int):
 
 def format_calculation_summary(items: list[dict], errors: list[str] | None = None) -> str:
     lines = ["🧮 Расчет готов", ""]
+    show_item_prices = should_show_item_prices(items)
     for index, item in enumerate(items, start=1):
         lines.extend(
             [
@@ -600,10 +758,11 @@ def format_calculation_summary(items: list[dict], errors: list[str] | None = Non
                 f"   Объем: {item['volume_mm3']:.2f} мм3",
                 f"   Объем: {item['volume_cm3']:.3f} см3",
                 f"   Материал: {format_material(item.get('material_category'), item.get('material_subcategory'))}",
-                f"   Цена: {format_money(item['price'])}",
-                "",
             ]
         )
+        if show_item_prices:
+            lines.append(f"   Цена: {format_money(item['price'])}")
+        lines.append("")
 
     lines.append(f"Итого до доставки: {format_money(calculate_order_total(items))}")
 
@@ -747,6 +906,7 @@ async def send_order_to_manager(message: Message, state: FSMContext):
     if not had_order_number:
         ORDER_COUNTER["next"] += 1
     save_state()
+    await append_order_to_google_sheets(user_id)
 
     await state.clear()
     await message.answer(
@@ -812,6 +972,10 @@ async def calculate_pending_files(message: Message, state: FSMContext):
         await message.answer(f"Считаю {index}/{len(pending_files)}: {file_name}")
 
         try:
+            if is_too_large_for_public_telegram_api(pending_file.get("file_size")):
+                errors.append(f"{file_name}: нужен локальный Telegram Bot API сервер для файлов больше 20 МБ")
+                continue
+
             await bot.download(pending_file["file_id"], destination=file_path)
             mesh = trimesh.load(file_path)
 
@@ -1358,12 +1522,17 @@ async def process_stl(message: Message, state: FSMContext):
         await message.answer("📎 Пожалуйста, отправьте .stl файл.", reply_markup=upload_keyboard)
         return
 
+    if is_too_large_for_public_telegram_api(document.file_size):
+        await message.answer(large_file_setup_message(document.file_size), reply_markup=upload_keyboard)
+        return
+
     await state.clear()
     pending_files = get_user_pending_files(message.from_user.id)
     pending_files.append(
         {
             "file_id": document.file_id,
             "file_name": document.file_name,
+            "file_size": document.file_size,
             "material_category": None,
             "material_subcategory": None,
         }
