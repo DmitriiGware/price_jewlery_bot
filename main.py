@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 
@@ -10,8 +11,10 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, KeyboardButton, LabeledPrice, Message, PreCheckoutQuery, ReplyKeyboardMarkup
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 
 load_dotenv(override=True)
@@ -26,6 +29,8 @@ DADATA_TOKEN = clean_secret(os.getenv("DADATA_TOKEN"))
 MANAGER_CHAT_ID = clean_secret(os.getenv("MANAGER_CHAT_ID"))
 PRIVATE_ORDERS_SHEET_ID = clean_secret(os.getenv("PRIVATE_ORDERS_SHEET_ID"))
 COMPANY_ORDERS_SHEET_ID = clean_secret(os.getenv("COMPANY_ORDERS_SHEET_ID"))
+GOOGLE_SERVICE_ACCOUNT_JSON = clean_secret(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+YOOKASSA_PROVIDER_TOKEN = clean_secret(os.getenv("YOOKASSA_PROVIDER_TOKEN"))
 TELEGRAM_API_BASE_URL = clean_secret(os.getenv("TELEGRAM_API_BASE_URL"))
 TELEGRAM_API_LOCAL_MODE = clean_secret(
     os.getenv("TELEGRAM_API_LOCAL_MODE") or os.getenv("TELEGRAM_API_IS_LOCAL")
@@ -61,6 +66,8 @@ USER_CARTS = {}
 USER_DELIVERIES = {}
 USER_ORDER_NUMBERS = {}
 USER_PENDING_FILES = {}
+USER_PAYMENTS = {}
+PROCESSED_PAYMENT_PAYLOADS = set()
 ORDER_COUNTER = {"next": 1}
 HELP_BUTTON_TEXT = "/help"
 CART_COMMAND = "cart"
@@ -68,7 +75,7 @@ CART_BUTTON_TEXT = "🛒 Корзина"
 ADD_MORE_COMMAND = "add_more"
 ADD_MORE_BUTTON_TEXT = "➕ Добавить еще"
 SEND_ORDER_COMMAND = "send_order"
-SEND_ORDER_TEXT = "📨 Отправить заказ менеджеру"
+SEND_ORDER_TEXT = "💳 Оплатить заказ"
 CALCULATE_BUTTON_TEXT = "🧮 Сделать расчет"
 CHOOSE_DELIVERY_TEXT = "🚚 Выбрать доставку"
 CHANGE_CART_MATERIAL_TEXT = "🔄 Изменить материал"
@@ -87,7 +94,7 @@ HELP_TEXT = """📘 Краткая инструкция
 /help — показать эту справку.
 /cart — открыть корзину. Также можно нажать кнопку «🛒 Корзина».
 /add_more — добавить еще STL-файлы к заказу.
-/send_order — отправить оформленный заказ менеджеру.
+/send_order — оплатить оформленный заказ. После подтверждения оплаты заказ автоматически уйдет менеджеру.
 
 Как пользоваться ботом:
 1. Нажмите /start и выберите тип клиента.
@@ -106,6 +113,7 @@ HELP_TEXT = """📘 Краткая инструкция
 В корзине можно посмотреть итог до доставки, изменить материал финального отлива или удалить отдельную модель.
 После формирования корзины можно нажать «➕ Добавить еще» и загрузить дополнительные файлы.
 После расчета выберите адрес доставки: известные адреса бесплатные, другой адрес — 800 руб. в пределах МКАД.
+Заказ отправляется менеджеру только после успешной оплаты через ЮKassa.
 Поддерживаемый файл: .stl
 Большие STL-файлы поддерживаются при подключенном локальном Telegram Bot API сервере."""
 
@@ -441,6 +449,10 @@ def load_state():
     USER_ORDER_NUMBERS.update(
         {int(user_id): order_number for user_id, order_number in state.get("order_numbers", {}).items()}
     )
+    USER_PAYMENTS.update(
+        {int(user_id): payment for user_id, payment in state.get("payments", {}).items()}
+    )
+    PROCESSED_PAYMENT_PAYLOADS.update(state.get("processed_payment_payloads", []))
     max_order_number = max(USER_ORDER_NUMBERS.values(), default=0)
     ORDER_COUNTER["next"] = max(int(state.get("next_order_number", 1)), max_order_number + 1)
 
@@ -451,6 +463,8 @@ def save_state():
         "carts": {str(user_id): cart for user_id, cart in USER_CARTS.items()},
         "deliveries": {str(user_id): delivery for user_id, delivery in USER_DELIVERIES.items()},
         "order_numbers": {str(user_id): order_number for user_id, order_number in USER_ORDER_NUMBERS.items()},
+        "payments": {str(user_id): payment for user_id, payment in USER_PAYMENTS.items()},
+        "processed_payment_payloads": sorted(PROCESSED_PAYMENT_PAYLOADS),
         "next_order_number": ORDER_COUNTER["next"],
     }
     temp_file = f"{STATE_FILE}.tmp"
@@ -488,6 +502,15 @@ def get_user_cart(user_id: int) -> list[dict]:
 
 def get_user_pending_files(user_id: int) -> list[dict]:
     return USER_PENDING_FILES.setdefault(user_id, [])
+
+
+def clear_completed_order(user_id: int):
+    USER_CARTS.pop(user_id, None)
+    USER_DELIVERIES.pop(user_id, None)
+    USER_ORDER_NUMBERS.pop(user_id, None)
+    USER_PAYMENTS.pop(user_id, None)
+    USER_LAST_CALCULATIONS.pop(user_id, None)
+    USER_PENDING_FILES.pop(user_id, None)
 
 
 def is_using_public_telegram_api() -> bool:
@@ -550,6 +573,37 @@ def calculate_order_total_with_delivery(user_id: int) -> float:
     return calculate_order_total(get_user_cart(user_id)) + USER_DELIVERIES.get(user_id, {}).get("price", 0)
 
 
+def calculate_order_total_kopecks(user_id: int) -> int:
+    return int(round(calculate_order_total_with_delivery(user_id) * 100))
+
+
+def build_cart_fingerprint(user_id: int) -> str:
+    payload = {
+        "cart": [
+            {
+                "file_name": item.get("file_name"),
+                "price": round(float(item.get("price", 0)), 2),
+                "volume_cm3": round(float(item.get("volume_cm3", 0)), 6),
+                "material_category": item.get("material_category"),
+                "material_subcategory": item.get("material_subcategory"),
+            }
+            for item in get_user_cart(user_id)
+        ],
+        "delivery": USER_DELIVERIES.get(user_id),
+        "total": calculate_order_total_kopecks(user_id),
+    }
+    serialized_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()[:12]
+
+
+def build_payment_payload(user_id: int) -> str:
+    return f"order:{user_id}:{calculate_order_total_kopecks(user_id)}:{build_cart_fingerprint(user_id)}"
+
+
+def is_valid_payment_payload(user_id: int, payload: str) -> bool:
+    return payload == build_payment_payload(user_id)
+
+
 def should_show_item_prices(items: list[dict]) -> bool:
     return len(items) > 1
 
@@ -572,6 +626,18 @@ def format_delivery(user_id: int) -> str:
     price = delivery.get("price", 0)
     price_text = "бесплатно" if price == 0 else format_money(price)
     return f"{delivery.get('address')} ({price_text})"
+
+
+def format_payment(user_id: int) -> str:
+    payment = USER_PAYMENTS.get(user_id)
+    if not payment:
+        return "не оплачено"
+
+    amount = payment.get("total_amount", 0) / 100
+    provider_charge_id = payment.get("provider_payment_charge_id")
+    if provider_charge_id:
+        return f"оплачено {format_money(amount)}, транзакция ЮKassa: {provider_charge_id}"
+    return f"оплачено {format_money(amount)}"
 
 
 def format_registration_summary(registration: dict) -> str:
@@ -641,6 +707,7 @@ def format_manager_order_summary(user_id: int) -> str:
         f"Telegram ID: {user_id}",
         format_registration_summary(registration),
         f"Доставка: {format_delivery(user_id)}",
+        f"Оплата: {format_payment(user_id)}",
         "",
         format_cart(user_id),
     ]
@@ -686,15 +753,37 @@ def build_company_order_sheet_row(user_id: int) -> list:
     ]
 
 
+def get_google_sheets_service():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+
+    credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
 async def append_order_row_to_google_sheet(sheet_id: str, columns: list[str], row: list, table_name: str):
     if not sheet_id:
-        print(f"Google Sheets заглушка: не указан ID таблицы для «{table_name}».")
+        print(f"Google Sheets: не указан ID таблицы для «{table_name}».")
+        return
+
+    service = get_google_sheets_service()
+    if not service:
+        print("Google Sheets: не задан GOOGLE_SERVICE_ACCOUNT_JSON.")
         print(dict(zip(columns, row)))
         return
 
-    # TODO: Подключить Google Sheets API и append строки в таблицу sheet_id.
-    print(f"Google Sheets заглушка: готова строка для «{table_name}» ({sheet_id}).")
-    print(dict(zip(columns, row)))
+    service.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range="A1",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]},
+    ).execute()
+    print(f"Google Sheets: строка добавлена в «{table_name}».")
 
 
 async def append_order_to_google_sheets(user_id: int):
@@ -719,7 +808,7 @@ async def append_order_to_google_sheets(user_id: int):
         )
         return
 
-    print(f"Google Sheets заглушка: неизвестный тип клиента для пользователя {user_id}.")
+    print(f"Google Sheets: неизвестный тип клиента для пользователя {user_id}.")
 
 
 async def send_order_files_to_manager(user_id: int):
@@ -867,6 +956,60 @@ async def save_delivery(message: Message, state: FSMContext, address: str, price
     )
 
 
+async def send_paid_order_to_manager(message: Message, state: FSMContext, payment: dict):
+    user_id = message.from_user.id
+
+    if payment.get("payload") in PROCESSED_PAYMENT_PAYLOADS:
+        await message.answer("✅ Эта оплата уже обработана, заказ уже отправлен менеджеру.", reply_markup=upload_keyboard)
+        return
+
+    if not get_user_cart(user_id) or user_id not in USER_DELIVERIES:
+        await message.answer(
+            "Оплата прошла, но я не нашел корзину или доставку для отправки менеджеру. Напишите менеджеру, пожалуйста.",
+            reply_markup=help_keyboard,
+        )
+        return
+
+    if not MANAGER_CHAT_ID:
+        await message.answer(
+            "Оплата прошла, но не настроен MANAGER_CHAT_ID в .env. Заказ пока не отправлен менеджеру.",
+            reply_markup=cart_keyboard,
+        )
+        return
+
+    ensure_user_order_number(user_id)
+    USER_PAYMENTS[user_id] = payment
+    save_state()
+
+    summary = format_manager_order_summary(user_id)
+
+    try:
+        await bot.send_message(MANAGER_CHAT_ID, summary)
+        await send_order_files_to_manager(user_id)
+    except Exception as error:
+        await message.answer(
+            f"Оплата прошла, но не удалось отправить заказ менеджеру.\nОшибка: {error}",
+            reply_markup=cart_keyboard,
+        )
+        return
+
+    try:
+        await append_order_to_google_sheets(user_id)
+    except Exception as error:
+        print(f"Google Sheets: не удалось записать заказ {format_order_number(user_id)}: {error}")
+
+    order_number = format_order_number(user_id)
+    PROCESSED_PAYMENT_PAYLOADS.add(payment.get("payload"))
+    clear_completed_order(user_id)
+    save_state()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Оплата подтверждена.\nЗаказ {order_number} отправлен менеджеру.",
+        reply_markup=upload_keyboard,
+    )
+
+
 async def send_order_to_manager(message: Message, state: FSMContext):
     user_id = message.from_user.id
     if not get_user_cart(user_id):
@@ -885,33 +1028,39 @@ async def send_order_to_manager(message: Message, state: FSMContext):
         )
         return
 
-    had_order_number = user_id in USER_ORDER_NUMBERS
-    if not had_order_number:
-        USER_ORDER_NUMBERS[user_id] = ORDER_COUNTER["next"]
+    if user_id in USER_PAYMENTS and USER_PAYMENTS[user_id].get("payload") not in PROCESSED_PAYMENT_PAYLOADS:
+        await message.answer("Оплата уже подтверждена, пробую отправить заказ менеджеру еще раз.")
+        await send_paid_order_to_manager(message, state, USER_PAYMENTS[user_id])
+        return
 
-    summary = format_manager_order_summary(user_id)
-
-    try:
-        await bot.send_message(MANAGER_CHAT_ID, summary)
-        await send_order_files_to_manager(user_id)
-    except Exception as error:
-        if not had_order_number:
-            USER_ORDER_NUMBERS.pop(user_id, None)
+    if not YOOKASSA_PROVIDER_TOKEN:
         await message.answer(
-            f"Не удалось отправить заказ менеджеру.\nОшибка: {error}",
+            "Не настроен YOOKASSA_PROVIDER_TOKEN в .env. Добавьте платежный токен ЮKassa из BotFather.",
             reply_markup=cart_keyboard,
         )
         return
 
-    if not had_order_number:
-        ORDER_COUNTER["next"] += 1
-    save_state()
-    await append_order_to_google_sheets(user_id)
+    total_kopecks = calculate_order_total_kopecks(user_id)
+    payload = build_payment_payload(user_id)
 
     await state.clear()
-    await message.answer(
-        f"✅ Заказ {format_order_number(user_id)} отправлен менеджеру.",
-        reply_markup=cart_keyboard,
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="Оплата заказа Smart Jewelry Estimator",
+        description="После успешной оплаты заказ автоматически уйдет менеджеру.",
+        payload=payload,
+        provider_token=YOOKASSA_PROVIDER_TOKEN,
+        currency="RUB",
+        prices=[
+            LabeledPrice(
+                label="Заказ с доставкой" if USER_DELIVERIES[user_id].get("price", 0) else "Заказ",
+                amount=total_kopecks,
+            )
+        ],
+        need_name=False,
+        need_phone_number=False,
+        need_email=False,
+        need_shipping_address=False,
     )
 
 
@@ -1064,6 +1213,47 @@ async def add_more_command(message: Message, state: FSMContext):
 @dp.message(lambda message: is_add_more_request(message.text))
 async def add_more_button(message: Message, state: FSMContext):
     await ask_to_upload_more(message, state)
+
+
+@dp.pre_checkout_query()
+async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
+    user_id = pre_checkout_query.from_user.id
+    error_message = "Заказ изменился. Откройте корзину и сформируйте оплату заново."
+
+    if not get_user_cart(user_id) or user_id not in USER_DELIVERIES:
+        await bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message=error_message,
+        )
+        return
+
+    if (
+        pre_checkout_query.currency != "RUB"
+        or pre_checkout_query.total_amount != calculate_order_total_kopecks(user_id)
+        or not is_valid_payment_payload(user_id, pre_checkout_query.invoice_payload)
+    ):
+        await bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message=error_message,
+        )
+        return
+
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message, state: FSMContext):
+    successful_payment = message.successful_payment
+    payment = {
+        "payload": successful_payment.invoice_payload,
+        "currency": successful_payment.currency,
+        "total_amount": successful_payment.total_amount,
+        "telegram_payment_charge_id": successful_payment.telegram_payment_charge_id,
+        "provider_payment_charge_id": successful_payment.provider_payment_charge_id,
+    }
+    await send_paid_order_to_manager(message, state, payment)
 
 
 @dp.message(Command(SEND_ORDER_COMMAND))
@@ -1651,7 +1841,7 @@ async def main():
             BotCommand(command="help", description="Краткая инструкция"),
             BotCommand(command=CART_COMMAND, description="Открыть корзину"),
             BotCommand(command=ADD_MORE_COMMAND, description="Добавить еще файлы"),
-            BotCommand(command=SEND_ORDER_COMMAND, description="Отправить заказ менеджеру"),
+            BotCommand(command=SEND_ORDER_COMMAND, description="Оплатить заказ"),
         ]
     )
     await dp.start_polling(bot)
