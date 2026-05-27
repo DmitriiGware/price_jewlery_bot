@@ -182,6 +182,7 @@ DELIVERY_OPTIONS = [
 PRIVATE_ORDERS_SHEET_COLUMNS = [
     "Номер заказа",
     "Telegram ID",
+    "Telegram username",
     "Имя",
     "Телефон",
     "Email",
@@ -193,6 +194,7 @@ PRIVATE_ORDERS_SHEET_COLUMNS = [
 COMPANY_ORDERS_SHEET_COLUMNS = [
     "Номер заказа",
     "Telegram ID",
+    "Telegram username",
     "Имя",
     "Телефон",
     "Email",
@@ -340,6 +342,24 @@ def normalize_phone(text: str | None) -> str:
 
 def normalize_inn(text: str | None) -> str:
     return "".join(ch for ch in normalize_text(text) if ch.isdigit())
+
+
+def format_telegram_username(username: str | None) -> str:
+    username = normalize_text(username)
+    if not username:
+        return ""
+    if username.startswith("@"):
+        return username
+    return f"@{username}"
+
+
+def update_user_telegram_identity(message: Message):
+    registration = USER_REGISTRATIONS.get(message.from_user.id)
+    if registration is None:
+        return
+
+    registration["telegram_id"] = message.from_user.id
+    registration["telegram_username"] = format_telegram_username(message.from_user.username)
 
 
 def is_valid_email(text: str | None) -> bool:
@@ -670,6 +690,7 @@ def build_private_order_sheet_row(user_id: int) -> list:
     return [
         format_order_number(user_id),
         user_id,
+        registration.get("telegram_username", ""),
         registration.get("name", ""),
         registration.get("phone", ""),
         registration.get("email", ""),
@@ -685,6 +706,7 @@ def build_company_order_sheet_row(user_id: int) -> list:
     return [
         format_order_number(user_id),
         user_id,
+        registration.get("telegram_username", ""),
         registration.get("name", ""),
         registration.get("phone", ""),
         registration.get("email", ""),
@@ -918,6 +940,8 @@ async def send_order_to_manager(message: Message, state: FSMContext):
         )
         return
 
+    update_user_telegram_identity(message)
+
     had_order_number = user_id in USER_ORDER_NUMBERS
     if not had_order_number:
         USER_ORDER_NUMBERS[user_id] = ORDER_COUNTER["next"]
@@ -1068,6 +1092,7 @@ async def ask_to_confirm_bank_details(message: Message, state: FSMContext, bank_
 
 async def complete_registration(message: Message, state: FSMContext, registration_data: dict):
     USER_REGISTRATIONS[message.from_user.id] = registration_data
+    update_user_telegram_identity(message)
     save_state()
     print(registration_data)
 
