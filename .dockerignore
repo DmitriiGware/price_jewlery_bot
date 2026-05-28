@@ -1,0 +1,8 @@
+.git
+.idea
+.venv
+__pycache__
+models
+bot_state.json
+bot_state.json.tmp
+.env
